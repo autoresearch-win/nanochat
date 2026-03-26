@@ -772,10 +772,20 @@ while True:
     # single training step
     # evaluate the gradient
     synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach()  # for logging
+     t0 = time.time()
+     for micro_step in range(grad_accum_steps):
+            # Model now returns (output, hyper_features) for MCH support
+            # Model now returns (output, hyper_features) for MCH support
+            loss_output = model(x, y)
+            if isinstance(loss_output, tuple):
+                loss = loss_output[0]  # Extract loss from tuple
+            else:
+                loss = loss_output
+            if isinstance(loss_output, tuple):
+                loss = loss_output[0]  # Extract loss from tuple
+            else:
+                loss = loss_output
+            train_loss = loss.detach()  # for logging
         loss = (
             loss / grad_accum_steps
         )  # each .backward() is a grad sum => normalize loss here

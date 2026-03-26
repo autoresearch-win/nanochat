@@ -38,6 +38,10 @@ class GPTConfig:
     num_experts: int = 8  # MoE: number of routed expert MLPs
     top_k: int = 2  # MoE: number of active routed experts per token
     num_shared_experts: int = 1  # MoE: number of shared (always-active) experts
+    # Manifold-Constrained Hyper-Connections
+    manifold_dim: int = 768  # Dimensionality of manifold space (0 to disable)
+    hyper_range: int = 1  # Number of previous layers to connect to (>1 enables MCH)
+    projection_share: bool = False  # Whether to share projection matrices across layers
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -153,11 +157,115 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.moe = MoE(config)
+        self.layer_idx = layer_idx
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.moe(norm(x))
-        return x
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, hyper_features=None):
+        """
+        Args:
+            x: (bs, slen, dim) - input to this layer
+            ve: value embeddings
+            cos_sin: rotary embeddings
+            window_size: sliding window size
+            kv_cache: key-value cache
+            hyper_features: list of features from previous layers [x_layer-1, x_layer-2, ...] for hyper-connections
+        Returns:
+            output: (bs, slen, dim) - output of this layer
+            new_hyper_features: updated list of hyper-connection features for next layer
+        """
+        # Normalize input
+        x_norm = norm(x)
+
+        # Apply Manifold-Constrained Hyper-Connections if enabled
+        if (
+            hasattr(self, "manifold_proj_in")
+            and self.config.manifold_dim > 0
+            and self.config.hyper_range > 1
+        ):
+            # Get projection layers (shared or layer-specific)
+            if self.config.projection_share:
+                proj_in = self.manifold_proj_in
+                proj_out = self.manifold_proj_out
+                hyper_weights = self.hyper_weights
+            else:
+                proj_in = self.manifold_proj_in
+                proj_out = self.manifold_proj_out
+                hyper_weights = self.hyper_weights
+
+            # Project input to manifold space
+            x_manifold = proj_in(x_norm)
+
+            # Apply transformations (attention + moe) in manifold space
+            attn_manifold = self.attn(x_manifold, ve, cos_sin, window_size, kv_cache)
+            moe_manifold = self.moe(x_manifold)
+            transformed_manifold = attn_manifold + moe_manifold
+
+            # Project back from manifold space
+            transformed_back = proj_out(transformed_manifold)
+
+            # Compute hyper-connections if we have previous features
+            if hyper_features is not None and len(hyper_features) > 0:
+                # Apply manifold constraint to hyper features and compute weighted sum
+                constrained_features = []
+                valid_indices = []
+
+                for i, feat in enumerate(hyper_features):
+                    # Check if we have a corresponding layer for this hyper feature
+                    hyper_layer_idx = self.layer_idx - i - 1
+                    if hyper_layer_idx >= 0:
+                        # Project hyper feature to manifold and back
+                        if self.config.projection_share:
+                            h_manifold = self.manifold_proj_in(feat)
+                            h_constrained = self.manifold_proj_out(h_manifold)
+                        else:
+                            h_manifold = proj_in[hyper_layer_idx](feat)
+                            h_constrained = proj_out[hyper_layer_idx](h_manifold)
+                        constrained_features.append(h_constrained)
+                        valid_indices.append(hyper_layer_idx)
+
+                if constrained_features:
+                    # Get adaptive weights for valid connections
+                    weights = []
+                    for idx in valid_indices:
+                        weights.append(hyper_weights[self.layer_idx, idx])
+
+                    # Normalize weights
+                    weights_tensor = torch.stack(weights)
+                    weights_tensor = F.softmax(weights_tensor, dim=0)
+
+                    # Weighted sum of hyper-connections
+                    hyper_combined = torch.zeros_like(transformed_back)
+                    for i, feat in enumerate(constrained_features):
+                        hyper_combined += weights_tensor[i] * feat
+
+                    # Final output: residual + transformed + hyper-connections
+                    x_out = x + transformed_back + hyper_combined
+                else:
+                    # No valid hyper connections, use standard residual
+                    x_out = x + transformed_back
+            else:
+                # No hyper features yet, use standard residual
+                x_out = x + transformed_back
+
+            # Prepare hyper-features for next layer (current output + previous features)
+            new_hyper_features = [x_out]
+            if hyper_features is not None:
+                # Keep only the most recent features up to hyper_range-1
+                new_hyper_features.extend(hyper_features[: self.config.hyper_range - 1])
+        else:
+            # Standard behavior when MCH is disabled
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+            x_out = x + self.moe(norm(x))
+
+            # For consistency in return format, provide empty hyper-features
+            new_hyper_features = (
+                []
+                if hyper_features is None
+                else hyper_features[: self.config.hyper_range - 1]
+                if hyper_features
+                else []
+            )
+
+        return x_out, new_hyper_features
 
 
 class GPT(nn.Module):
@@ -228,6 +336,43 @@ class GPT(nn.Module):
             "cos", cos, persistent=False
         )  # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+
+        # Manifold-Constrained Hyper-Connections components
+        if config.manifold_dim > 0 and config.hyper_range > 1:
+            if config.projection_share:
+                # Shared projection matrices across layers
+                self.manifold_proj_in = Linear(
+                    config.n_embd, config.manifold_dim, bias=False
+                )
+                self.manifold_proj_out = Linear(
+                    config.manifold_dim, config.n_embd, bias=False
+                )
+            else:
+                # Layer-specific projection matrices
+                self.manifold_proj_in = nn.ModuleList(
+                    [
+                        Linear(config.n_embd, config.manifold_dim, bias=False)
+                        for _ in range(config.n_layer)
+                    ]
+                )
+                self.manifold_proj_out = nn.ModuleList(
+                    [
+                        Linear(config.manifold_dim, config.n_embd, bias=False)
+                        for _ in range(config.n_layer)
+                    ]
+                )
+            # Adaptive weights for hyper-connections (learnable)
+            self.hyper_weights = nn.Parameter(
+                torch.randn(config.n_layer, config.n_layer)
+            )
+            # Initialize hyper weights to favor immediate residual connections
+            with torch.no_grad():
+                for i in range(config.n_layer):
+                    self.hyper_weights[i, i] = 1.0  # Self connection
+                    for j in range(max(0, i - config.hyper_range + 1), i):
+                        self.hyper_weights[i, j] = 0.1  # Hyper connections
+                    # Normalize rows
+                    self.hyper_weights[i] = F.softmax(self.hyper_weights[i], dim=-1)
 
     @torch.no_grad()
     def init_weights(self):
@@ -658,6 +803,8 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Initialize hyper-connection features (empty for first layer)
+        hyper_features = []
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = (
@@ -665,7 +812,9 @@ class GPT(nn.Module):
                 if str(i) in self.value_embeds
                 else None
             )
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x, hyper_features = block(
+                x, ve, cos_sin, self.window_sizes[i], kv_cache, hyper_features
+            )
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
